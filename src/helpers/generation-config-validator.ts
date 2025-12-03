@@ -187,6 +187,126 @@ export class GenerationConfigValidator {
 		return generationConfig;
 	}
 
+	/**
+	 * Filters a JSON Schema property to be compatible with Gemini API.
+	 * Removes unsupported properties and converts complex types.
+	 * @param property - The JSON Schema property to filter
+	 * @returns A Gemini-compatible schema property
+	 */
+	private static filterSchemaProperty(property: unknown): unknown {
+		if (typeof property !== "object" || property === null) {
+			return property;
+		}
+
+		const prop = property as Record<string, unknown>;
+		const filtered: Record<string, unknown> = {};
+
+		// Handle 'type' - convert array of types to single type
+		if (prop.type) {
+			if (Array.isArray(prop.type)) {
+				// If type is an array like ["string", "null"], pick the first non-null type
+				const types = prop.type.filter((t: unknown) => t !== "null");
+				filtered.type = types.length > 0 ? types[0] : "string";
+			} else {
+				filtered.type = prop.type;
+			}
+		}
+
+		// Copy basic supported properties
+		if (prop.description) filtered.description = prop.description;
+		if (prop.enum) filtered.enum = prop.enum;
+		if (prop.format) filtered.format = prop.format;
+
+		// Handle nested properties recursively
+		if (prop.properties && typeof prop.properties === "object") {
+			filtered.properties = {};
+			for (const [key, value] of Object.entries(prop.properties)) {
+				(filtered.properties as Record<string, unknown>)[key] = this.filterSchemaProperty(value);
+			}
+		}
+
+		// Handle array items recursively
+		if (prop.items) {
+			filtered.items = this.filterSchemaProperty(prop.items);
+		}
+
+		// Handle required fields
+		if (Array.isArray(prop.required)) {
+			filtered.required = prop.required;
+		}
+
+		// Handle additionalProperties
+		if (prop.additionalProperties !== undefined) {
+			if (typeof prop.additionalProperties === "boolean") {
+				filtered.additionalProperties = prop.additionalProperties;
+			} else {
+				filtered.additionalProperties = this.filterSchemaProperty(prop.additionalProperties);
+			}
+		}
+
+		// Handle minimum/maximum (but not exclusive variants)
+		if (typeof prop.minimum === "number") filtered.minimum = prop.minimum;
+		if (typeof prop.maximum === "number") filtered.maximum = prop.maximum;
+
+		// Explicitly ignore unsupported properties:
+		// - strict (OpenAI-specific)
+		// - const (not supported by Gemini)
+		// - $ref, $schema, $id (JSON Schema references)
+		// - exclusiveMinimum, exclusiveMaximum (not supported)
+		// - anyOf, oneOf, allOf, not (complex schemas)
+		// - minLength, maxLength, pattern (may not be supported)
+
+		return filtered;
+	}
+
+	/**
+	 * Filters a complete JSON Schema to be compatible with Gemini API.
+	 * @param schema - The JSON Schema to filter
+	 * @returns A Gemini-compatible schema
+	 */
+	private static filterGeminiCompatibleSchema(schema: Record<string, unknown>): Record<string, unknown> {
+		const filtered: Record<string, unknown> = {};
+
+		// Copy type
+		if (schema.type) {
+			if (Array.isArray(schema.type)) {
+				const types = schema.type.filter((t: unknown) => t !== "null");
+				filtered.type = types.length > 0 ? types[0] : "object";
+			} else {
+				filtered.type = schema.type;
+			}
+		}
+
+		// Copy description
+		if (schema.description) {
+			filtered.description = schema.description;
+		}
+
+		// Filter properties recursively
+		if (schema.properties && typeof schema.properties === "object") {
+			filtered.properties = {};
+			for (const [key, value] of Object.entries(schema.properties)) {
+				(filtered.properties as Record<string, unknown>)[key] = this.filterSchemaProperty(value);
+			}
+		}
+
+		// Copy required fields
+		if (Array.isArray(schema.required)) {
+			filtered.required = schema.required;
+		}
+
+		// Handle additionalProperties
+		if (schema.additionalProperties !== undefined) {
+			if (typeof schema.additionalProperties === "boolean") {
+				filtered.additionalProperties = schema.additionalProperties;
+			} else {
+				filtered.additionalProperties = this.filterSchemaProperty(schema.additionalProperties);
+			}
+		}
+
+		return filtered;
+	}
+
 	static createValidateTools(options: Partial<ChatCompletionRequest> = {}) {
 		const tools = [];
 		let toolConfig = {};
@@ -194,18 +314,27 @@ export class GenerationConfigValidator {
 		if (Array.isArray(options.tools) && options.tools.length > 0) {
 			const functionDeclarations = options.tools.map((tool) => {
 				let parameters = tool.function.parameters;
-				// Filter parameters for Claude-style compatibility by removing keys starting with '$'
+				// Filter parameters for Gemini compatibility
 				if (parameters) {
-					const before = parameters;
-					parameters = Object.keys(parameters)
-						.filter((key) => !key.startsWith("$"))
-						.reduce(
-							(after, key) => {
-								after[key] = before[key];
-								return after;
-							},
-							{} as Record<string, unknown>
+					try {
+						parameters = this.filterGeminiCompatibleSchema(parameters);
+						console.log(
+							`[GenerationConfig] Filtered tool '${tool.function.name}' parameters for Gemini compatibility`
 						);
+					} catch (error) {
+						console.error(`[GenerationConfig] Error filtering tool '${tool.function.name}':`, error);
+						// Fallback to basic filtering if advanced filtering fails
+						const before = parameters;
+						parameters = Object.keys(parameters)
+							.filter((key) => !key.startsWith("$"))
+							.reduce(
+								(after, key) => {
+									after[key] = before[key];
+									return after;
+								},
+								{} as Record<string, unknown>
+							);
+					}
 				}
 				return {
 					name: tool.function.name,
@@ -242,13 +371,10 @@ export class GenerationConfigValidator {
 		toolConfig: unknown | undefined;
 	} {
 		if (config.useCustomTools && config.customTools && config.customTools.length > 0) {
-			const { toolConfig } = this.createValidateTools(options);
+			// Use the filtered tools from createValidateTools instead of raw config.customTools
+			const { tools: filteredTools, toolConfig } = this.createValidateTools(options);
 			return {
-				tools: [
-					{
-						functionDeclarations: config.customTools.map((t) => t.function)
-					}
-				],
+				tools: filteredTools,
 				toolConfig: toolConfig
 			};
 		}

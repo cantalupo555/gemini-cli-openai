@@ -194,18 +194,9 @@ export class GenerationConfigValidator {
 		if (Array.isArray(options.tools) && options.tools.length > 0) {
 			const functionDeclarations = options.tools.map((tool) => {
 				let parameters = tool.function.parameters;
-				// Filter parameters for Claude-style compatibility by removing keys starting with '$'
+				// Filter parameters for Gemini compatibility
 				if (parameters) {
-					const before = parameters;
-					parameters = Object.keys(parameters)
-						.filter((key) => !key.startsWith("$"))
-						.reduce(
-							(after, key) => {
-								after[key] = before[key];
-								return after;
-							},
-							{} as Record<string, unknown>
-						);
+					parameters = this.filterGeminiCompatibleSchema(parameters as Record<string, unknown>);
 				}
 				return {
 					name: tool.function.name,
@@ -234,6 +225,58 @@ export class GenerationConfigValidator {
 
 		return { tools, toolConfig };
 	}
+
+	private static filterGeminiCompatibleSchema(schema: Record<string, unknown>): Record<string, unknown> {
+		const filtered: Record<string, unknown> = {};
+
+		if (schema.type) {
+			filtered.type = this.sanitizeType(schema.type);
+			// Handle nullable if it was an array type containing 'null'
+			if (Array.isArray(schema.type) && schema.type.includes("null")) {
+				filtered.nullable = true;
+			}
+		}
+		if (schema.description) filtered.description = schema.description;
+		if (schema.required) filtered.required = schema.required;
+		if (schema.properties) {
+			filtered.properties = this.filterProperties(schema.properties as Record<string, unknown>);
+		}
+		// Handle array items
+		if (schema.items) {
+			filtered.items = this.filterGeminiCompatibleSchema(schema.items as Record<string, unknown>);
+		}
+		// Handle enum
+		if (schema.enum) {
+			filtered.enum = schema.enum;
+		}
+
+		return filtered;
+	}
+
+	private static filterProperties(properties: Record<string, unknown>): Record<string, unknown> {
+		const filtered: Record<string, unknown> = {};
+
+		for (const [key, value] of Object.entries(properties)) {
+			if (typeof value === "object" && value !== null) {
+				filtered[key] = this.filterGeminiCompatibleSchema(value as Record<string, unknown>);
+			}
+		}
+
+		return filtered;
+	}
+
+	private static sanitizeType(type: unknown): string {
+		if (Array.isArray(type)) {
+			// If array [string, null], take the first non-null type
+			const validTypes = type.filter((t) => t !== "null");
+			if (validTypes.length > 0) {
+				return String(validTypes[0]).toUpperCase();
+			}
+			return "STRING"; // Default
+		}
+		return String(type).toUpperCase();
+	}
+
 	static createFinalToolConfiguration(
 		config: NativeToolsConfiguration,
 		options: Partial<ChatCompletionRequest> = {}

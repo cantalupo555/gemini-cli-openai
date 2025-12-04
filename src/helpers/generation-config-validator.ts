@@ -14,6 +14,40 @@ import { NativeToolsConfiguration } from "../types/native-tools";
  */
 export class GenerationConfigValidator {
 	/**
+	 * Properties in JSON Schema that are not supported by Gemini API
+	 * These will be filtered out during schema conversion
+	 */
+	private static readonly UNSUPPORTED_SCHEMA_PROPERTIES = [
+		'strict',
+		'const',
+		'$ref',
+		'exclusiveMinimum',
+		'exclusiveMaximum',
+		'uniqueItems',
+		'patternProperties',
+		'dependencies',
+		'if',
+		'then',
+		'else',
+		'allOf',
+		'anyOf',
+		'oneOf',
+		'not',
+		'additionalProperties',
+		'propertyNames',
+		'contains',
+		'minProperties',
+		'maxProperties',
+		'dependentRequired',
+		'dependentSchemas',
+		'pattern',
+		'format',
+		'minLength',
+		'maxLength',
+		'minItems',
+		'maxItems'
+	];
+	/**
 	 * Maps reasoning effort to thinking budget based on model type.
 	 * @param effort - The reasoning effort level
 	 * @param modelId - The model ID to determine if it's a flash model
@@ -187,6 +221,72 @@ export class GenerationConfigValidator {
 		return generationConfig;
 	}
 
+	/**
+	 * Filters a JSON Schema to remove properties not supported by Gemini API
+	 * @param schema - The original schema in OpenAI/JSON Schema format
+	 * @returns Schema compatible with Gemini API
+	 */
+	private static filterGeminiCompatibleSchema(schema: Record<string, unknown>): Record<string, unknown> {
+		const filtered: Record<string, unknown> = {};
+		const removedProperties: string[] = [];
+		
+		for (const [key, value] of Object.entries(schema)) {
+			// Skip unsupported properties
+			if (this.UNSUPPORTED_SCHEMA_PROPERTIES.includes(key)) {
+				removedProperties.push(key);
+				continue;
+			}
+			
+			// Handle special cases
+			if (key === 'type') {
+				if (Array.isArray(value)) {
+					// Convert array of types to first valid type
+					filtered[key] = value.find((t: unknown) => typeof t === 'string') || 'string';
+					if (value.length > 1) {
+						console.log(`[GenerationConfig] Converted type array [${value.join(', ')}] to single type: ${filtered[key]}`);
+					}
+				} else {
+					filtered[key] = value;
+				}
+			} else if (key === 'properties' && typeof value === 'object' && value !== null) {
+				// Filter nested properties recursively
+				filtered[key] = this.filterProperties(value as Record<string, unknown>);
+			} else if (key === 'items' && typeof value === 'object' && value !== null) {
+				// Filter array items schema recursively
+				filtered[key] = this.filterGeminiCompatibleSchema(value as Record<string, unknown>);
+			} else if (key === 'additionalProperties' && typeof value === 'boolean') {
+				// Remove boolean additionalProperties (not supported by Gemini)
+				removedProperties.push(key);
+			} else {
+				// Keep the original value for supported properties
+				filtered[key] = value;
+			}
+		}
+		
+		if (removedProperties.length > 0) {
+			console.log(`[GenerationConfig] Removed unsupported schema properties: ${removedProperties.join(', ')}`);
+		}
+		
+		return filtered;
+	}
+
+	/**
+	 * Filters properties object recursively to remove unsupported schema properties
+	 * @param properties - The properties object to filter
+	 * @returns Filtered properties object
+	 */
+	private static filterProperties(properties: Record<string, unknown>): Record<string, unknown> {
+		const filtered: Record<string, unknown> = {};
+		
+		for (const [propName, propSchema] of Object.entries(properties)) {
+			if (typeof propSchema === 'object' && propSchema !== null) {
+				filtered[propName] = this.filterGeminiCompatibleSchema(propSchema as Record<string, unknown>);
+			}
+		}
+		
+		return filtered;
+	}
+
 	static createValidateTools(options: Partial<ChatCompletionRequest> = {}) {
 		const tools = [];
 		let toolConfig = {};
@@ -194,18 +294,17 @@ export class GenerationConfigValidator {
 		if (Array.isArray(options.tools) && options.tools.length > 0) {
 			const functionDeclarations = options.tools.map((tool) => {
 				let parameters = tool.function.parameters;
-				// Filter parameters for Claude-style compatibility by removing keys starting with '$'
+				// Filter parameters for Gemini compatibility by removing unsupported schema properties
 				if (parameters) {
-					const before = parameters;
-					parameters = Object.keys(parameters)
-						.filter((key) => !key.startsWith("$"))
-						.reduce(
-							(after, key) => {
-								after[key] = before[key];
-								return after;
-							},
-							{} as Record<string, unknown>
-						);
+					const originalKeys = Object.keys(parameters);
+					parameters = this.filterGeminiCompatibleSchema(parameters as Record<string, unknown>);
+					const filteredKeys = Object.keys(parameters);
+					const removedKeys = originalKeys.filter(key => !filteredKeys.includes(key));
+					
+					// Log removed properties for debugging
+					if (removedKeys.length > 0) {
+						console.log(`[GenerationConfig] Removed unsupported schema properties from tool '${tool.function.name}': ${removedKeys.join(', ')}`);
+					}
 				}
 				return {
 					name: tool.function.name,

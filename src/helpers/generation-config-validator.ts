@@ -13,6 +13,25 @@ import { NativeToolsConfiguration } from "../types/native-tools";
  * Handles model-specific limitations and provides sensible defaults.
  */
 export class GenerationConfigValidator {
+	// JSON Schema properties not supported by Gemini API
+	private static readonly UNSUPPORTED_SCHEMA_PROPERTIES = [
+		"strict",
+		"const",
+		"$ref",
+		"exclusiveMinimum",
+		"exclusiveMaximum",
+		"uniqueItems",
+		"patternProperties",
+		"dependencies",
+		"if",
+		"then",
+		"else",
+		"allOf",
+		"anyOf",
+		"oneOf",
+		"not"
+	];
+
 	/**
 	 * Maps reasoning effort to thinking budget based on model type.
 	 * @param effort - The reasoning effort level
@@ -187,6 +206,68 @@ export class GenerationConfigValidator {
 		return generationConfig;
 	}
 
+	/**
+	 * Filters a JSON Schema to remove properties not supported by Gemini
+	 * @param schema - Original schema in OpenAI/JSON Schema format
+	 * @returns Schema compatible with Gemini API
+	 */
+	private static filterGeminiCompatibleSchema(schema: Record<string, unknown>): Record<string, unknown> {
+		const filtered: Record<string, unknown> = {};
+
+		for (const [key, value] of Object.entries(schema)) {
+			// Skip unsupported properties
+			if (this.UNSUPPORTED_SCHEMA_PROPERTIES.includes(key)) {
+				continue;
+			}
+
+			// Skip keys that start with '$'
+			if (key.startsWith("$")) {
+				continue;
+			}
+
+			// Handle array in 'type' (e.g., ["string", "null"] -> "string")
+			if (key === "type" && Array.isArray(value)) {
+				const firstType = value.find((t) => t !== "null") || value[0];
+				filtered[key] = firstType;
+				continue;
+			}
+
+			// Recursively filter 'properties'
+			if (key === "properties" && typeof value === "object" && value !== null) {
+				filtered[key] = this.filterProperties(value as Record<string, unknown>);
+				continue;
+			}
+
+			// Recursively filter 'items'
+			if (key === "items" && typeof value === "object" && value !== null) {
+				filtered[key] = this.filterGeminiCompatibleSchema(value as Record<string, unknown>);
+				continue;
+			}
+
+			// Keep other properties
+			filtered[key] = value;
+		}
+
+		return filtered;
+	}
+
+	/**
+	 * Filters nested properties in a schema
+	 * @param properties - Schema properties object
+	 * @returns Filtered properties
+	 */
+	private static filterProperties(properties: Record<string, unknown>): Record<string, unknown> {
+		const filtered: Record<string, unknown> = {};
+
+		for (const [propName, propSchema] of Object.entries(properties)) {
+			if (typeof propSchema === "object" && propSchema !== null) {
+				filtered[propName] = this.filterGeminiCompatibleSchema(propSchema as Record<string, unknown>);
+			}
+		}
+
+		return filtered;
+	}
+
 	static createValidateTools(options: Partial<ChatCompletionRequest> = {}) {
 		const tools = [];
 		let toolConfig = {};
@@ -194,18 +275,9 @@ export class GenerationConfigValidator {
 		if (Array.isArray(options.tools) && options.tools.length > 0) {
 			const functionDeclarations = options.tools.map((tool) => {
 				let parameters = tool.function.parameters;
-				// Filter parameters for Claude-style compatibility by removing keys starting with '$'
+				// Filter parameters for Gemini compatibility
 				if (parameters) {
-					const before = parameters;
-					parameters = Object.keys(parameters)
-						.filter((key) => !key.startsWith("$"))
-						.reduce(
-							(after, key) => {
-								after[key] = before[key];
-								return after;
-							},
-							{} as Record<string, unknown>
-						);
+					parameters = this.filterGeminiCompatibleSchema(parameters as Record<string, unknown>);
 				}
 				return {
 					name: tool.function.name,
